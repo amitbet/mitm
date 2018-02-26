@@ -40,10 +40,28 @@ func Server(cn net.Conn, p ServerParam) *ServerConn {
 		*conf = *p.TLSConfig
 	}
 	sc := new(ServerConn)
+
 	conf.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		sc.ServerName = hello.ServerName
 		return getCert(p.CA, hello.ServerName)
 	}
+
+	sc.Conn = tls.Server(cn, conf)
+	return sc
+}
+
+func ServerForIPAddress(cn net.Conn, p ServerParam, ServerNames ...string) *ServerConn {
+	conf := new(tls.Config)
+	if p.TLSConfig != nil {
+		*conf = *p.TLSConfig
+	}
+	sc := new(ServerConn)
+
+	conf.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		sc.ServerName = ServerNames[0]
+		return getCert(p.CA, ServerNames...)
+	}
+
 	sc.Conn = tls.Server(cn, conf)
 	return sc
 }
@@ -127,6 +145,7 @@ var (
 )
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	//fmt.Println("got request: ", req)
 	if p.SkipRequest == nil {
 		p.SkipRequest = SkipNone
 	}
@@ -162,13 +181,51 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	sc, ok := cn.(*ServerConn)
+	name := dnsName(req.Host)
+	isIpAddress := net.ParseIP(name) != nil
 	if !ok {
-		name := dnsName(req.Host)
+		//name := dnsName(req.Host)
+
 		if name == "" {
 			log.Println("cannot determine cert name for " + req.Host)
 			io.WriteString(cn, noDownstreamHeader)
 			return
 		}
+		// if this is an ip:
+		if isIpAddress {
+			log.Println("got server IP:", name)
+			conf := new(tls.Config)
+			if p.TLSClientConfig != nil {
+				*conf = *p.TLSClientConfig
+			}
+			conf.InsecureSkipVerify = true
+			//conf.ServerName = name
+			//conf.RootCAs = p.
+			address := net.JoinHostPort(name, "443")
+			cconn, err := tls.Dial("tcp", address, conf)
+			if err != nil {
+				log.Println("Error in server connection while using IP:", err)
+				return
+			}
+			names := cconn.ConnectionState().PeerCertificates[0].DNSNames
+			log.Println("got names from cert:", names)
+			// cc = &ServerConn{Conn: sconn, ServerName: names[0]}
+
+			names = append([]string{name}, names...)
+
+			sc = ServerForIPAddress(cn, ServerParam{
+				CA:        p.CA,
+				TLSConfig: p.TLSServerConfig,
+			}, names...)
+			if err := sc.Handshake(); err != nil {
+				log.Println("Server Handshake:", err)
+				return
+			}
+			// //log.Println("ConnectionState.certs:")
+			p.proxyMITM(sc, cconn)
+			return
+		}
+
 		sc = Server(cn, ServerParam{
 			CA:        p.CA,
 			TLSConfig: p.TLSServerConfig,
@@ -177,8 +234,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			log.Println("Server Handshake:", err)
 			return
 		}
-	}
 
+	}
+	//servName := sc.ServerName
+	// log.Println("server name:", servName)
+	// log.Println("ConnectionState:", sc)
+	// log.Println("ConnectionState:", sc.ConnectionState())
+	// log.Println("ConnectionState.certs:", sc.ConnectionState().PeerCertificates)
+	// if servName == "" {
+	// 	servName = sc.ConnectionState().PeerCertificates[0].DNSNames[0]
+	// }
+	//log.Println("server name:", servName)
+
+	// if isIpAddress {
+	// 	if p.TLSClientConfig == nil {
+	// 		p.TLSClientConfig = new(tls.Config)
+	// 	}
+	// 	p.TLSClientConfig.InsecureSkipVerify = true
+	// 	p.TLSClientConfig.ServerName = net.JoinHostPort(name, "443")
+	// }
 	cc, err := p.tlsDial(req.Host, sc.ServerName)
 	if err != nil {
 		log.Println("tlsDial:", err)
@@ -368,15 +442,15 @@ var (
 	certCacheMutex sync.RWMutex
 )
 
-func getCert(ca *tls.Certificate, host string) (*tls.Certificate, error) {
-	if c := getCachedCert(ca, host); c != nil {
+func getCert(ca *tls.Certificate, hosts ...string) (*tls.Certificate, error) {
+	if c := getCachedCert(ca, hosts[0]); c != nil {
 		return c, nil
 	}
-	cert, err := GenerateCert(ca, host)
+	cert, err := GenerateCert(ca, hosts...)
 	if err != nil {
 		return nil, err
 	}
-	cacheCert(ca, host, cert)
+	cacheCert(ca, hosts[0], cert)
 	return cert, nil
 }
 
